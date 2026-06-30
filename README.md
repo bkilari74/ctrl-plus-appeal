@@ -4,7 +4,16 @@
 
 Ctrl+Appeal is a provider-side, agentic denial management and appeals automation system built entirely on UiPath Cloud. It ingests healthcare claim denials from any source (835 ERA files, payer portal RPA, faxed letters via Document Understanding), classifies each into one of five denial routes using a LangGraph classification agent, handles each route end-to-end, and keeps a licensed physician in the loop for every medical-necessity determination — satisfying California SB 1120 by construction.
 
-**The problem it solves:** US hospitals receive $260–300B in claim denials annually. ~65% are never appealed — not because appeals fail (3:1 ROI), but because the manual process (2–4 hrs/appeal) exhausts bandwidth before timely-filing deadlines pass. Ctrl+Appeal eliminates that bottleneck while preserving physician authority over clinical decisions.
+**The problem it solves:** US hospitals receive $260–300B in claim denials annually. ~65% are never appealed — not because appeals fail (3:1 ROI), but because the manual process (45–60 min/appeal) exhausts bandwidth before timely-filing deadlines pass. Ctrl+Appeal eliminates that bottleneck while preserving physician authority over clinical decisions.
+
+## Team
+
+| Name | Role |
+|---|---|
+| Shweta Chandra | Automation Architect |
+| Sumit Paithankar | Automation Developer |
+| Bharath Kilari | Automation Developer |
+| Lokesh Raj | Automation Developer |
 
 ## UiPath Components
 
@@ -15,8 +24,17 @@ Ctrl+Appeal is a provider-side, agentic denial management and appeals automation
 | **Data Fabric** | IngestionData entity for denial records, classification result persistence, payer policy document store |
 | **Action Center** | Billing specialist review queue; physician attestation tasks for SB 1120 compliance gate |
 | **Studio Web** | All process logic, Data Fabric R/W, route branch activities — zero desktop dependencies |
-| **UiPath Apps** | Billing specialist UI: denial + AI-drafted appeal letter side-by-side with approve/edit/escalate controls |
 | **Document Understanding** | OCR and extraction for faxed/scanned denial letters |
+
+## The Five Denial Routes
+
+| Route | CARC Codes | Handling |
+|---|---|---|
+| Medical Necessity | CO-50, CO-151 | RAG over payer policy → AI appeal draft → physician sign-off (SB 1120 gate) |
+| Eligibility | CO-27, CO-31 | Re-verify eligibility at date of service → resubmit or move to patient responsibility |
+| Coding Error | CO-4, CO-11 | Coder corrects CPT/ICD codes → resubmit corrected claim |
+| Duplicate | CO-18 | ICN-first composite-key claims history match → close if true duplicate, else appeal as distinct |
+| Timely Filing | CO-29 | Deadline math against payer filing-limit table → file exception with proof, or write-off |
 
 ## Agent Type
 
@@ -27,62 +45,101 @@ Ctrl+Appeal is a provider-side, agentic denial management and appeals automation
 
 ## Setup Instructions
 
+> **Note:** This is a 100% UiPath Cloud project. All components are configured through the UiPath Cloud UI — there are no local files to clone and run. The repository contains documentation, exported agent definitions, test data, and architecture artifacts.
+
 ### Prerequisites
-- UiPath Cloud account with access to: Maestro, Agent Builder, Data Fabric, Action Center, Studio Web, UiPath Apps
-- AWS Bedrock access (for Claude Haiku via UiPath's Bedrock wrapper)
+- UiPath Cloud account with access to: Maestro, Agent Builder, Data Fabric, Action Center, Studio Web
+- AWS Bedrock access configured in your UiPath tenant (for Claude Haiku)
 - UiPath Document Understanding license
 
 ### Step 1 — Data Fabric Setup
-1. In Data Fabric, create an entity named `IngestionData` with the following fields:
-   - `record_id` (String, primary key)
-   - `carc_code` (String)
-   - `rarc_code` (String)
-   - `date_of_service` (Date)
-   - `billed_amount` (Decimal)
-   - `denied_amount` (Decimal)
-   - `paid_amount` (Decimal)
-   - `denial_classification` (String)
-   - `requires_human` (Boolean)
-   - `payer_id` (String)
-   - `claim_id` (String)
+In Data Fabric, create an entity named `IngestionData` with the following fields:
+
+| Field | Type |
+|---|---|
+| `record_id` | String (primary key) |
+| `carc_code` | String |
+| `rarc_code` | String |
+| `date_of_service` | Date |
+| `billed_amount` | Decimal |
+| `denied_amount` | Decimal |
+| `paid_amount` | Decimal |
+| `denial_classification` | String |
+| `requires_human` | Boolean |
+| `payer_id` | String |
+| `claim_id` | String |
 
 ### Step 2 — Classification Agent Deployment
 1. In Agent Builder, create a new Coded Agent
-2. Upload the LangGraph classification agent code from `/agents/classification_agent/`
+2. Upload the LangGraph agent code from `/agents/classification_agent/`
 3. Configure the Bedrock connection to Claude Haiku
 4. Set input arguments: `record_id` (String)
 5. Set output arguments: `record_id` (String), `denial_classification` (String), `requires_human` (Boolean)
 6. Deploy the agent
 
-### Step 3 — Maestro BPMN Import
-1. In Maestro, import the process definition from `/maestro/ctrl_appeal_main.bpmn`
-2. Configure the exclusive gateway branch conditions:
-   - `medical_necessity` → Medical Necessity subprocess
-   - `eligibility` → Eligibility subprocess
-   - `coding_error` → Coding Error subprocess
-   - `duplicate` → Duplicate Claim subprocess
-   - `timely_filing` → Timely Filing subprocess
-3. Wire the Classification Agent call to the Data Fabric write step (decoupled — agent reads, Maestro writes)
+**Guardrails built into the agent:**
+- Confidence < 0.70 → routes to human review (Action Center)
+- `medical_necessity` → always `requires_human = true` (SB 1120 compliance)
+- Unknown/conflicting CARC → defaults to `eligibility` + human flag
+- Write is decoupled: agent reads and classifies only; a downstream Maestro activity handles all Data Fabric writes
+
+### Step 3 — Maestro BPMN Configuration
+In Maestro, configure the main process with the following exclusive gateway branches:
+
+| Branch condition | Subprocess |
+|---|---|
+| `denial_classification == "medical_necessity"` | Medical Necessity subprocess (RAG + appeal draft + Action Center) |
+| `denial_classification == "eligibility"` | Eligibility subprocess |
+| `denial_classification == "coding_error"` | Coding Error subprocess |
+| `denial_classification == "duplicate"` | Duplicate Claim subprocess |
+| `denial_classification == "timely_filing"` | Timely Filing subprocess |
+
+Wire the Classification Agent invocation so the result is persisted by a dedicated Maestro Data Fabric write activity — not by the agent itself.
 
 ### Step 4 — Action Center Configuration
-1. Create two task types in Action Center:
-   - **Specialist Review:** Assigned to billing team queue
-   - **Physician Attestation:** Assigned to physician queue (SB 1120 gate — medical_necessity route only)
-2. Configure escalation rules: unworked tasks > 48hrs escalate to supervisor
+Create two task types in Action Center:
+- **Specialist Review:** Assigned to billing team queue
+- **Physician Attestation:** Assigned to physician queue — this is the SB 1120 gate, triggered only on the `medical_necessity` route
 
-### Step 5 — UiPath Apps
-1. Import the app definition from `/apps/specialist_review_app/`
-2. Connect to the `IngestionData` Data Fabric entity and Action Center task queue
-3. Publish and assign access to billing specialist role
-
-### Step 6 — Load Test Data
+### Step 5 — Load Test Data
 1. Load the synthetic dataset from `/test_data/` into Data Fabric
-2. The depth set (10 claims) covers all 5 routes including the hero case (David Okafor, CO-50, sepsis)
-3. Gold-label classification file at `/test_data/gold_labels_88.csv` for routing accuracy validation
+2. The depth set (10 claims) covers all 5 routes, including the fully-wired hero case: David Okafor, CO-50, sepsis inpatient, Meridian MP-114 §4.2
+3. Gold-label classification file at `/test_data/gold_labels_88.csv` for measuring routing accuracy
 
 ### Running the Demo
 1. Trigger ingestion by uploading the sample 835 ERA file from `/test_data/835_era_sample.edi`
-2. The classification agent will triage all claims — check Agent Builder execution logs
-3. Technical denials (Duplicate, Timely Filing) will process automatically
-4. The David Okafor CO-50 case will route to Action Center for physician review
-5. Approve the AI-drafted appeal in Action Center to complete the end-to-end flow
+2. The classification agent triages all claims — check Agent Builder execution logs
+3. Technical denials (Duplicate, Timely Filing, Coding Error, Eligibility) process through their respective Maestro subprocesses automatically
+4. The David Okafor CO-50 case routes to Action Center for physician attestation
+5. Approve the AI-drafted appeal in Action Center to complete the full end-to-end flow
+
+## Repository Structure
+
+```
+ctrl-appeal/
+├── README.md
+├── agents/
+│   └── classification_agent/     # LangGraph coded agent (Claude Haiku via Bedrock)
+├── maestro/
+│   └── process_notes.md          # BPMN branch logic and phase documentation
+├── test_data/
+│   ├── 835_era_sample.edi
+│   ├── gold_labels_88.csv
+│   └── denial_letters/
+├── docs/
+│   ├── architecture_diagram.png
+│   └── hero_case.png
+└── presentation/
+    └── CtrlAppeal_AgentHack2026.pptx
+```
+
+## Key Numbers
+
+- **$260–300B** in annual US hospital claim denials
+- **65%** of denials never appealed — bandwidth constraint, not viability
+- **3:1** appeal ROI on worked cases
+- **45–60 min** per appeal manually → seconds with Ctrl+Appeal
+- **5** denial routes handled end-to-end
+- **7** process phases
+- **88** gold-labeled denials in evaluation dataset
+- **SB 1120** compliant by construction — physician always in the loop
