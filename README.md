@@ -2,7 +2,7 @@
 
 ## Project Description
 
-Ctrl+Appeal is a provider-side, agentic denial management and appeals automation system built entirely on UiPath Cloud. It ingests healthcare claim denials from any source (835 ERA files, payer portal RPA, faxed letters via Document Understanding), classifies each into one of five denial routes using a LangGraph classification agent, handles each route end-to-end, and keeps a licensed physician in the loop for every medical-necessity determination — satisfying California SB 1120 by construction.
+Ctrl+Appeal is a provider-side, agentic denial management and appeals automation system built entirely on UiPath Cloud. It ingests healthcare claim denials from 835 EDI files, classifies each into one of five denial routes using a LangGraph classification agent, handles each route end-to-end through dedicated Maestro BPMN subprocesses, and keeps a licensed physician in the loop for every medical-necessity determination — satisfying California SB 1120 by construction.
 
 **The problem it solves:** US hospitals receive $260–300B in claim denials annually. ~65% are never appealed — not because appeals fail (3:1 ROI), but because the manual process (45–60 min/appeal) exhausts bandwidth before timely-filing deadlines pass. Ctrl+Appeal eliminates that bottleneck while preserving physician authority over clinical decisions.
 
@@ -19,45 +19,84 @@ Ctrl+Appeal is a provider-side, agentic denial management and appeals automation
 
 | Component | Usage |
 |---|---|
-| **Maestro BPMN** | 5-branch exclusive gateway, 7-phase process orchestration, long-running 30/60/90-day timer events for response tracking |
-| **Agent Builder** | Hosts three agents: Ingestion Agent, Classification Agent (LangGraph/coded), Appeal Drafter Agent |
-| **Data Fabric** | IngestionData entity for denial records, classification result persistence, payer policy document store |
-| **Action Center** | Billing specialist review queue; physician attestation tasks for SB 1120 compliance gate |
-| **Studio Web** | All process logic, Data Fabric R/W, route branch activities — zero desktop dependencies |
-| **Document Understanding** | OCR and extraction for faxed/scanned denial letters |
+| **Maestro BPMN** | Exclusive gateway routing denials into 5 subprocess branches; orchestrates the full ingestion-to-resolution flow |
+| **Agent Builder** | Hosts the Classification Agent (LangGraph/coded) and the Appeal Letter Generation Agent |
+| **Data Fabric** | `IngestionData` entity — work queue for denial records, written by RPA ingestion, read by the classification agent, updated by every downstream Maestro activity |
+| **Action Center / Action Apps** | Human touchpoints: Action App for CPT code correction, Action App for DOS/eligibility verification, Action App for appeal letter editing, and Action Center physician attestation (SB 1120 gate) |
+| **Studio Web** | All process logic, Data Fabric R/W, RPA file ingestion — zero desktop dependencies |
+
+## Process Flow (as built in Maestro)
+
+```
+Start
+ └─ Get Files Detail (RPA reads 835 EDI files, converts to JSON)
+     └─ Agent to Update the Data Fabric (writes ingested records to work queue)
+         └─ Get Each Denial Record (loop)
+             └─ Classification Agent (reads record, returns denial_type)
+                 └─ Update Entity Record
+                     └─ Determine Denial Type? (exclusive gateway)
+                         ├─ Medical Necessity   → policy RAG → appeal letter → physician sign-off
+                         ├─ Duplicate Claim      → prior-claim-paid check → close or escalate
+                         ├─ Timely Filing        → deadline math → proof upload or resubmit
+                         ├─ Coding Error         → Action App correction → resubmit
+                         └─ Eligibility          → DOS/eligibility verification → resubmit or write-off
+```
+
+Full branch-by-branch logic (every gateway condition and node) is documented in [`maestro/process_notes.md`](./maestro/process_notes.md).
 
 ## The Five Denial Routes
 
 | Route | CARC Codes | Handling |
 |---|---|---|
 | Medical Necessity | CO-50, CO-151 | RAG over payer policy → AI appeal draft → physician sign-off (SB 1120 gate) |
-| Eligibility | CO-27, CO-31 | Re-verify eligibility at date of service → resubmit or move to patient responsibility |
-| Coding Error | CO-4, CO-11 | Coder corrects CPT/ICD codes → resubmit corrected claim |
-| Duplicate | CO-18 | ICN-first composite-key claims history match → close if true duplicate, else appeal as distinct |
-| Timely Filing | CO-29 | Deadline math against payer filing-limit table → file exception with proof, or write-off |
+| Eligibility | CO-27, CO-31 | Action App verifies DOS/eligibility → resubmit or move to patient responsibility |
+| Coding Error | CO-4, CO-11 | Action App for CPT/ICD correction → resubmit corrected claim |
+| Duplicate | CO-18 | Prior-claim-paid check → close if true duplicate, else escalate as distinct service |
+| Timely Filing | CO-29 | Deadline math against payer filing-limit table → proof upload or resubmit |
+
+## Classification Agent
+
+LangGraph coded agent deployed via Agent Builder, running Claude Haiku via UiPath's Bedrock wrapper.
+
+**Pattern:** `prepare → react_agent → postprocess`
+
+- **prepare** — reads the denial record (CARC, RARC, DOS, billed/denied/paid amounts) from the `IngestionData` Data Fabric entity
+- **react_agent** — deterministic CARC→route lookup first; escalates to a Claude Haiku ReAct call only when the CARC is unmapped, or when billed/denied/paid amounts don't reconcile (partial-denial detection)
+- **postprocess** — applies guardrails and returns the final classification; does **not** write to Data Fabric — persistence is handled by a downstream Maestro activity (write-decoupling for reliability)
+
+**Guardrails:**
+- Confidence < 0.70 → escalate to human (Action Center)
+- `medical_necessity` → always `requires_human = true` (SB 1120, non-negotiable)
+- Unmapped/conflicting CARC → defaults to `eligibility` + human flag
+
+Full agent code is in [`agents/classification_agent/`](./agents/classification_agent/), including local-testable stubs for the Data Fabric and Bedrock calls (swapped for UiPath's native SDKs at deployment).
+
+**Validated routing accuracy: 88/88 (100%)** against the gold-labeled test set — see [`test_data/validate_routing.py`](./test_data/validate_routing.py).
 
 ## Agent Type
 
 **Both Coded Agents and Low-code Agents.**
 
-- **Coded Agent (Classification Agent):** LangGraph-based, deployed via Agent Builder. Uses the UiPath starter template adapted to run Claude Haiku via UiPath's Bedrock wrapper. Pattern: `prepare → react_agent → postprocess`. Built with Claude Code (Anthropic) — external coding agent, qualifying for the judging bonus.
-- **Low-code Agents (Ingestion Agent, Appeal Drafter Agent):** Configured in Agent Builder using UiPath's low-code interface.
+- **Coded Agent (Classification Agent):** LangGraph-based, built with Claude Code (Anthropic) — external coding agent, qualifying for the judging bonus.
+- **Low-code Agent (Appeal Letter Generation Agent):** Configured in Agent Builder using UiPath's low-code interface; runs the policy RAG and drafts the medical-necessity appeal letter.
 
 ## Setup Instructions
 
-> **Note:** This is a 100% UiPath Cloud project. All components are configured through the UiPath Cloud UI — there are no local files to clone and run. The repository contains documentation, exported agent definitions, test data, and architecture artifacts.
+> **Note:** This is a 100% UiPath Cloud project. Maestro, Data Fabric, and Action Center/Action Apps are configured through the UiPath Cloud UI — there are no local files to clone and run for those components. This repository documents the architecture and contains the one genuinely local artifact: the classification agent's code.
 
 ### Prerequisites
-- UiPath Cloud account with access to: Maestro, Agent Builder, Data Fabric, Action Center, Studio Web
+- UiPath Cloud account with access to: Maestro, Agent Builder, Data Fabric, Action Center
 - AWS Bedrock access configured in your UiPath tenant (for Claude Haiku)
-- UiPath Document Understanding license
+- Python 3.10+ and `langgraph` installed locally if you want to run/test the agent outside Agent Builder
 
 ### Step 1 — Data Fabric Setup
-In Data Fabric, create an entity named `IngestionData` with the following fields:
+Create an `IngestionData` entity with the following fields:
 
 | Field | Type |
 |---|---|
 | `record_id` | String (primary key) |
+| `claim_id` | String |
+| `payer_id` | String |
 | `carc_code` | String |
 | `rarc_code` | String |
 | `date_of_service` | Date |
@@ -66,51 +105,39 @@ In Data Fabric, create an entity named `IngestionData` with the following fields
 | `paid_amount` | Decimal |
 | `denial_classification` | String |
 | `requires_human` | Boolean |
-| `payer_id` | String |
-| `claim_id` | String |
 
 ### Step 2 — Classification Agent Deployment
 1. In Agent Builder, create a new Coded Agent
-2. Upload the LangGraph agent code from `/agents/classification_agent/`
-3. Configure the Bedrock connection to Claude Haiku
-4. Set input arguments: `record_id` (String)
-5. Set output arguments: `record_id` (String), `denial_classification` (String), `requires_human` (Boolean)
-6. Deploy the agent
-
-**Guardrails built into the agent:**
-- Confidence < 0.70 → routes to human review (Action Center)
-- `medical_necessity` → always `requires_human = true` (SB 1120 compliance)
-- Unknown/conflicting CARC → defaults to `eligibility` + human flag
-- Write is decoupled: agent reads and classifies only; a downstream Maestro activity handles all Data Fabric writes
+2. Upload the agent code from `/agents/classification_agent/agent.py`
+3. Replace the local stub clients (`data_fabric_client.py`, `bedrock_client.py`) with calls to UiPath's native Data Fabric SDK and tenant-configured Bedrock wrapper — see `agents/classification_agent/README.md` for exact swap points
+4. Set input argument: `record_id` (String)
+5. Set output arguments: `record_id`, `denial_classification`, `requires_human`
+6. Deploy
 
 ### Step 3 — Maestro BPMN Configuration
-In Maestro, configure the main process with the following exclusive gateway branches:
+Build the process per the flow documented in [`maestro/process_notes.md`](./maestro/process_notes.md):
+1. RPA ingestion step reads 835 EDI files and converts to JSON
+2. An agent step writes ingested records into the `IngestionData` work queue
+3. A loop pulls each unprocessed record and invokes the Classification Agent
+4. An exclusive gateway (`Determine Denial Type?`) branches on the returned `denial_classification` into the 5 subprocesses
+5. Wire each subprocess's write activity to update `IngestionData` directly in Maestro — never inside the agent
 
-| Branch condition | Subprocess |
-|---|---|
-| `denial_classification == "medical_necessity"` | Medical Necessity subprocess (RAG + appeal draft + Action Center) |
-| `denial_classification == "eligibility"` | Eligibility subprocess |
-| `denial_classification == "coding_error"` | Coding Error subprocess |
-| `denial_classification == "duplicate"` | Duplicate Claim subprocess |
-| `denial_classification == "timely_filing"` | Timely Filing subprocess |
-
-Wire the Classification Agent invocation so the result is persisted by a dedicated Maestro Data Fabric write activity — not by the agent itself.
-
-### Step 4 — Action Center Configuration
-Create two task types in Action Center:
-- **Specialist Review:** Assigned to billing team queue
-- **Physician Attestation:** Assigned to physician queue — this is the SB 1120 gate, triggered only on the `medical_necessity` route
+### Step 4 — Action Center / Action Apps Configuration
+- **Action App — CPT Code Correction:** Coding Error branch
+- **Action App — DOS/Eligibility Verification:** Eligibility branch
+- **Action App — Appeal Letter Editing:** Timely Filing branch (post-deadline-validation)
+- **Action Center — Physician Attestation:** Medical Necessity branch only — this is the SB 1120 compliance gate and should be the only step tracked as a formal Action Center task rather than a lightweight Action App
 
 ### Step 5 — Load Test Data
-1. Load the synthetic dataset from `/test_data/` into Data Fabric
-2. The depth set (10 claims) covers all 5 routes, including the fully-wired hero case: David Okafor, CO-50, sepsis inpatient, Meridian MP-114 §4.2
-3. Gold-label classification file at `/test_data/gold_labels_88.csv` for measuring routing accuracy
+1. Place `gold_labels_88.csv` in `/test_data/` (already included in this repo)
+2. Run `python test_data/validate_routing.py` to confirm 88/88 routing accuracy locally
+3. The dataset includes the fully-wired hero case: `REC-0001`, David Okafor, CO-50, sepsis inpatient, Meridian MP-114 §4.2
 
 ### Running the Demo
-1. Trigger ingestion by uploading the sample 835 ERA file from `/test_data/835_era_sample.edi`
-2. The classification agent triages all claims — check Agent Builder execution logs
-3. Technical denials (Duplicate, Timely Filing, Coding Error, Eligibility) process through their respective Maestro subprocesses automatically
-4. The David Okafor CO-50 case routes to Action Center for physician attestation
+1. Trigger ingestion with a sample 835 EDI file
+2. The classification agent triages each record — check Agent Builder execution logs
+3. Coding Error, Duplicate, Eligibility, and Timely Filing routes resolve through their Action Apps automatically or with light human input
+4. The David Okafor medical-necessity case routes to Action Center for physician attestation
 5. Approve the AI-drafted appeal in Action Center to complete the full end-to-end flow
 
 ## Repository Structure
@@ -119,12 +146,18 @@ Create two task types in Action Center:
 ctrl-appeal/
 ├── README.md
 ├── agents/
-│   └── classification_agent/     # LangGraph coded agent (Claude Haiku via Bedrock)
+│   └── classification_agent/
+│       ├── agent.py              # LangGraph coded agent (prepare → react_agent → postprocess)
+│       ├── data_fabric_client.py # Local test stub — swap for UiPath Data Fabric SDK
+│       ├── bedrock_client.py     # Local test stub — swap for UiPath Bedrock wrapper
+│       └── README.md
 ├── maestro/
-│   └── process_notes.md          # BPMN branch logic and phase documentation
+│   └── process_notes.md          # Full BPMN branch-by-branch documentation
 ├── test_data/
+│   ├── gold_labels_88.csv        # 88 gold-labeled synthetic denials
+│   ├── generate_gold_labels.py   # Script used to generate the dataset
+│   ├── validate_routing.py       # Validates agent accuracy against gold labels
 │   ├── 835_era_sample.edi
-│   ├── gold_labels_88.csv
 │   └── denial_letters/
 ├── docs/
 │   ├── architecture_diagram.png
@@ -140,6 +173,5 @@ ctrl-appeal/
 - **3:1** appeal ROI on worked cases
 - **45–60 min** per appeal manually → seconds with Ctrl+Appeal
 - **5** denial routes handled end-to-end
-- **7** process phases
-- **88** gold-labeled denials in evaluation dataset
-- **SB 1120** compliant by construction — physician always in the loop
+- **88/88 (100%)** routing accuracy on the gold-labeled test set
+- **SB 1120** compliant by construction — physician always in the loop for medical necessity
